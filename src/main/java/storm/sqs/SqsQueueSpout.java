@@ -5,6 +5,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
 
+import backtype.storm.spout.Scheme;
+import backtype.storm.topology.OutputFieldsDeclarer;
 import com.amazonaws.AmazonClientException;
 import com.amazonaws.auth.PropertiesCredentials;
 import com.amazonaws.services.sqs.AmazonSQSAsync;
@@ -22,159 +24,160 @@ import backtype.storm.utils.Utils;
 
 /**
  * A Spout which consumes an Amazon SQS queue.
- * 
+ * <p>
  * Subclasses should simply override two methods:
  * <ul>
- *   <li>{@link #declareOutputFields(OutputFieldsDeclarer) declareOutputFields}
- *   <li>{@link #messageToStormTuple(Message) messageToStormTuple}, which turns
- *   an SQS message into a Storm tuple matching the declared output fields.
+ * <li>{@link #declareOutputFields(OutputFieldsDeclarer) declareOutputFields}
+ * <li>{@link #messageToStormTuple(Message) messageToStormTuple}, which turns
+ * an SQS message into a Storm tuple matching the declared output fields.
  * </ul>
- * 
+ * <p>
  * This Spout also comes in two "flavors" -- reliable and unreliable.
- * 
+ * <p>
  * The unreliable version deletes messages from SQS as soon as they are consumed,
  * and therefore tuples cannot be replayed. This version does not anchor tuples.
- * 
+ * <p>
  * The reliable version waits until a tuple has been completely {@code ack}ed
  * before deleting it from SQS. If the tuple {@code fail}s, then the visibility
  * timeout on that message is reset to 0, so it will be replayed immediately.
  * This matches Storm's own reliability model remarkably well.
- * 
+ * <p>
  * <p>
  * <b>WARNING:</b> You should ensure that the VisibilityTimeout parameter
- * of your Amazon SQS queue is (significantly, in order to account for 
+ * of your Amazon SQS queue is (significantly, in order to account for
  * network delays) longer than Storm's {@code TOPOLOGY_MESSAGE_TIMEOUT_SECS}
  * parameter. Otherwise, it is possible that a message which Storm is taking a
  * long time to process could be made visible again by SQS, and consumed again
  * by Storm, before {@code ack} or {@code fail} have a chance to be called.
- * 
- * @author Adrian Petrescu <apetresc@gmail.com>
  *
+ * @author Adrian Petrescu <apetresc@gmail.com>
  */
-public abstract class SqsQueueSpout extends BaseRichSpout {
-	protected SpoutOutputCollector collector;
-	protected AmazonSQSAsync sqs;
-	protected LinkedBlockingQueue<Message> queue;
-	
-	private final String queueUrl;
-	private final boolean reliable;
-	
-	private int sleepTime;
+public class SqsQueueSpout extends BaseRichSpout {
+    protected SpoutOutputCollector collector;
+    protected AmazonSQSAsync sqs;
+    protected LinkedBlockingQueue<Message> queue;
 
-	/**
-	 * @param queueUrl the URL for the Amazon SQS queue to consume from
-	 * @param reliable whether this spout uses Storm's reliability facilities
-	 */
-	public SqsQueueSpout(String queueUrl, boolean reliable) {
-		this.queueUrl = queueUrl;
-		this.reliable = reliable;
-		this.sleepTime = 100;
-	}
+    private final String queueUrl;
+    private final boolean reliable;
 
-	@Override
-	public void open(
-			@SuppressWarnings("rawtypes") Map conf, TopologyContext context, SpoutOutputCollector collector) {
-	
-		this.collector = collector;
-		queue = new LinkedBlockingQueue<>();
-		try {
-			sqs = new AmazonSQSAsyncClient(new PropertiesCredentials(SqsQueueSpout.class.getResourceAsStream("/AwsCredentials.properties")));
-		} catch (IOException ioe) {
-			throw new RuntimeException("Couldn't load AWS credentials", ioe);
-		}
-	}
+    private int sleepTime;
+    private Scheme scheme;
 
-	@Override
-	public void nextTuple() {
-		if (queue.isEmpty()) {
-			ReceiveMessageResult receiveMessageResult = sqs.receiveMessage(
-					new ReceiveMessageRequest(queueUrl).withMaxNumberOfMessages(10));
-			queue.addAll(receiveMessageResult.getMessages());
-		}
-		
-		
-		Message message = queue.poll();
-		if (message != null) {
-			if (reliable) {
-				collector.emit(getStreamId(message), messageToStormTuple(message), message.getReceiptHandle());
-			} else {
-				// Delete it right away
-				sqs.deleteMessageAsync(new DeleteMessageRequest(queueUrl, message.getReceiptHandle()));
+    /**
+     * @param queueUrl the URL for the Amazon SQS queue to consume from
+     * @param reliable whether this spout uses Storm's reliability facilities
+     */
+    public SqsQueueSpout(String queueUrl, Scheme scheme, boolean reliable) {
+        this.queueUrl = queueUrl;
+        this.reliable = reliable;
+        this.sleepTime = 100;
+        this.scheme = scheme;
+    }
 
-				collector.emit(getStreamId(message), messageToStormTuple(message));
-			}
-		} else {
-			// Still empty, go to sleep.
-			Utils.sleep(sleepTime);
-		}
-	}
+    @Override public void open(@SuppressWarnings("rawtypes") Map conf, TopologyContext context,
+        SpoutOutputCollector collector) {
 
-	/**
-	 * Returns the stream on which this spout will emit. By default, it is just
-	 * {@code Utils.DEFAULT_STREAM_ID}. Simply override this method to send to
-	 * a different stream.
-	 * 
-	 * By using the {@code message} parameter, you can send different messages
-	 * to different streams based on context.
-	 *
-	 * @return the stream on which this spout will emit.
-	 */
-	public String getStreamId(Message message) {
-		return Utils.DEFAULT_STREAM_ID;
-	}
-	
-	/**
-	 * Returns the number of milliseconds the spout will wait before making
-	 * another call to SQS when the previous call came back empty. Defaults to
-	 * {@code 100}.
-	 * 
-	 * Since Amazon charges per SQS request, you can use this parameter to
-	 * control costs for lower-volume queues.
-	 * 
-	 * @return the number of milliseconds the spout will wait between SQS calls.
-	 */
-	public int getSleepTime() {
-		return sleepTime;
-	}
-	
-	/**
-	 * Sets the number of milliseconds the spout will wait before making
-	 * another call to SQS when the previous call came back empty.
-	 * 
-	 * Since Amazon charges per SQS request, you can use this parameter to
-	 * control costs for lower-volume queues.
-	 * 
-	 * @param sleepTime the number of milliseconds the spout will wait between SQS calls.
-	 */
-	public void setSleepTime(int sleepTime) {
-		this.sleepTime = sleepTime;
-	}
-	
-	@Override
-	public void ack(Object msgId) {
-		// Only called in reliable mode.
-		try {
-			sqs.deleteMessageAsync(new DeleteMessageRequest(queueUrl, (String) msgId));
-		} catch (AmazonClientException ace) { }
-	}
+        this.collector = collector;
+        queue = new LinkedBlockingQueue<Message>();
+        sqs = new AmazonSQSAsyncClient();
+    }
 
-	@Override
-	public void fail(Object msgId) {
-		// Only called in reliable mode.
-		try {
-			sqs.changeMessageVisibilityAsync(
-					new ChangeMessageVisibilityRequest(queueUrl, (String) msgId, 0));
-		} catch (AmazonClientException ace) { }
-	}
-	
-	public abstract List<Object> messageToStormTuple(Message message);
+    @Override public void nextTuple() {
+        if (queue.isEmpty()) {
+            ReceiveMessageResult receiveMessageResult =
+                sqs.receiveMessage(new ReceiveMessageRequest(queueUrl).withMaxNumberOfMessages(10));
+            queue.addAll(receiveMessageResult.getMessages());
+        }
 
-	@Override
-	public void close() {
-		sqs.shutdown();
-		// Works around a known bug in the Async clients
-		// @see https://forums.aws.amazon.com/thread.jspa?messageID=305371
-		((AmazonSQSAsyncClient) sqs).getExecutorService().shutdownNow();
-	}
 
+        Message message = queue.poll();
+        if (message != null) {
+            if (reliable) {
+                collector.emit(getStreamId(message), messageToStormTuple(message),
+                    message.getReceiptHandle());
+            } else {
+                // Delete it right away
+                sqs.deleteMessageAsync(
+                    new DeleteMessageRequest(queueUrl, message.getReceiptHandle()));
+
+                collector.emit(getStreamId(message), messageToStormTuple(message));
+            }
+        } else {
+            // Still empty, go to sleep.
+            Utils.sleep(sleepTime);
+        }
+    }
+
+    /**
+     * Returns the stream on which this spout will emit. By default, it is just
+     * {@code Utils.DEFAULT_STREAM_ID}. Simply override this method to send to
+     * a different stream.
+     * <p>
+     * By using the {@code message} parameter, you can send different messages
+     * to different streams based on context.
+     *
+     * @return the stream on which this spout will emit.
+     */
+    public String getStreamId(Message message) {
+        return Utils.DEFAULT_STREAM_ID;
+    }
+
+    /**
+     * Returns the number of milliseconds the spout will wait before making
+     * another call to SQS when the previous call came back empty. Defaults to
+     * {@code 100}.
+     * <p>
+     * Since Amazon charges per SQS request, you can use this parameter to
+     * control costs for lower-volume queues.
+     *
+     * @return the number of milliseconds the spout will wait between SQS calls.
+     */
+    public int getSleepTime() {
+        return sleepTime;
+    }
+
+    /**
+     * Sets the number of milliseconds the spout will wait before making
+     * another call to SQS when the previous call came back empty.
+     * <p>
+     * Since Amazon charges per SQS request, you can use this parameter to
+     * control costs for lower-volume queues.
+     *
+     * @param sleepTime the number of milliseconds the spout will wait between SQS calls.
+     */
+    public void setSleepTime(int sleepTime) {
+        this.sleepTime = sleepTime;
+    }
+
+    @Override public void ack(Object msgId) {
+        // Only called in reliable mode.
+        try {
+            sqs.deleteMessageAsync(new DeleteMessageRequest(queueUrl, (String) msgId));
+        } catch (AmazonClientException ace) {
+        }
+    }
+
+    @Override public void fail(Object msgId) {
+        // Only called in reliable mode.
+        try {
+            sqs.changeMessageVisibilityAsync(
+                new ChangeMessageVisibilityRequest(queueUrl, (String) msgId, 0));
+        } catch (AmazonClientException ace) {
+        }
+    }
+
+    public List<Object> messageToStormTuple(Message message) {
+        return this.scheme.deserialize(message.getBody().getBytes());
+    }
+
+    @Override public void close() {
+        sqs.shutdown();
+        // Works around a known bug in the Async clients
+        // @see https://forums.aws.amazon.com/thread.jspa?messageID=305371
+        ((AmazonSQSAsyncClient) sqs).getExecutorService().shutdownNow();
+    }
+
+    @Override public void declareOutputFields(OutputFieldsDeclarer outputFieldsDeclarer) {
+        outputFieldsDeclarer.declare(this.scheme.getOutputFields());
+    }
 }
