@@ -1,6 +1,5 @@
 package storm.sqs;
 
-import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -8,14 +7,9 @@ import java.util.concurrent.LinkedBlockingQueue;
 import backtype.storm.spout.Scheme;
 import backtype.storm.topology.OutputFieldsDeclarer;
 import com.amazonaws.AmazonClientException;
-import com.amazonaws.auth.PropertiesCredentials;
 import com.amazonaws.services.sqs.AmazonSQSAsync;
 import com.amazonaws.services.sqs.AmazonSQSAsyncClient;
-import com.amazonaws.services.sqs.model.ChangeMessageVisibilityRequest;
-import com.amazonaws.services.sqs.model.DeleteMessageRequest;
-import com.amazonaws.services.sqs.model.Message;
-import com.amazonaws.services.sqs.model.ReceiveMessageRequest;
-import com.amazonaws.services.sqs.model.ReceiveMessageResult;
+import com.amazonaws.services.sqs.model.*;
 
 import backtype.storm.spout.SpoutOutputCollector;
 import backtype.storm.task.TopologyContext;
@@ -57,18 +51,19 @@ public class SqsQueueSpout extends BaseRichSpout {
     protected AmazonSQSAsync sqs;
     protected LinkedBlockingQueue<Message> queue;
 
-    private final String queueUrl;
+    private final String queueName;
+    private String queueUrl;
     private final boolean reliable;
 
     private int sleepTime;
     private Scheme scheme;
 
     /**
-     * @param queueUrl the URL for the Amazon SQS queue to consume from
+     * @param queueName the name for the Amazon SQS queue to consume from
      * @param reliable whether this spout uses Storm's reliability facilities
      */
-    public SqsQueueSpout(String queueUrl, Scheme scheme, boolean reliable) {
-        this.queueUrl = queueUrl;
+    public SqsQueueSpout(String queueName, Scheme scheme, boolean reliable) {
+        this.queueName = queueName;
         this.reliable = reliable;
         this.sleepTime = 100;
         this.scheme = scheme;
@@ -80,6 +75,9 @@ public class SqsQueueSpout extends BaseRichSpout {
         this.collector = collector;
         queue = new LinkedBlockingQueue<Message>();
         sqs = new AmazonSQSAsyncClient();
+
+        GetQueueUrlResult result = sqs.getQueueUrl(queueName);
+        queueUrl = result.getQueueUrl();
     }
 
     @Override public void nextTuple() {
